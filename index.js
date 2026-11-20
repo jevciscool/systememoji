@@ -2,17 +2,167 @@
   "use strict";
 
   // ---- Settings you can tweak -------------------------------------------
-  const SCALE = 0.8;        // emoji size relative to the image box (0.7 - 0.9)
-  const DEBUG = true;       // toast the first time an emoji is replaced
-  const LOG_MISSES = true;  // log emoji-looking images we could NOT replace
+  const SCALE = 0.7;          // emoji size inside image boxes (0.7 - 0.9)
+  const DEBUG = true;         // popup messages (set false when everything works)
+  const LOG_MISSES = true;    // write debug info to Revenge's debug logs
+  const FIX_MESSAGES = true;  // layer 1: messages + replies (chat data)
+  const FIX_IMAGES = true;    // layer 2: picker, menus, other images
   // -----------------------------------------------------------------------
 
   const { findByProps } = vendetta.metro;
   const { React, ReactNative } = vendetta.metro.common;
   const { before, instead } = vendetta.patcher;
 
-  // Pull a uri string out of whatever shape an image source has:
-  // string, { uri }, [{ uri }], or a numeric bundled-asset id.
+  const unpatches = [];
+  const logged = new Set();
+
+  function log(...a) {
+    if (!LOG_MISSES) return;
+    try {
+      console.log("[System Emoji]", ...a);
+    } catch (e) {}
+  }
+  function logOnce(key, ...a) {
+    if (logged.has(key) || logged.size > 40) return;
+    logged.add(key);
+    log(...a);
+  }
+  function toast(text) {
+    if (!DEBUG) return;
+    try {
+      vendetta.ui.toasts.showToast(text);
+    } catch (e) {}
+  }
+
+  // ---- Shared helper: turn an emoji picture address into the real emoji --
+  // Handles: asset:/emoji-1f600.png | emoji_1f600 | .../twemoji/.../1f600.svg
+  function decode(uri) {
+    if (typeof uri !== "string" || !/emoji/i.test(uri)) return null;
+    if (/\/emojis\//i.test(uri)) return null; // custom server emoji: leave alone
+    const file = uri
+      .split("?")[0]
+      .split("#")[0]
+      .split("/")
+      .pop()
+      .replace(/\.(png|webp|svg|jpe?g)$/i, "");
+    const m = /^(?:twemoji[-_]|emoji[-_])?([0-9a-f]{2,6}(?:[-_][0-9a-f]{2,6})*)$/i.exec(
+      file
+    );
+    if (!m) return null;
+    try {
+      return String.fromCodePoint(
+        ...m[1].split(/[-_]/).map((h) => parseInt(h, 16))
+      );
+    } catch (e) {
+      return null;
+    }
+  }
+
+  // ======================================================================
+  // LAYER 1: messages and replies.
+  // Discord draws the chat list natively, so React patches can't reach it.
+  // Instead we edit the message data right before it is handed to the
+  // native chat, turning emoji nodes into plain text nodes.
+  // ======================================================================
+  function emojiChar(node) {
+    if (typeof node.surrogate === "string" && node.surrogate) return node.surrogate;
+    const fromUrl = decode(node.src) || decode(node.frozenSrc) || decode(node.url);
+    if (fromUrl) return fromUrl;
+    // Last resort: alt text, but only if it looks like an emoji and not a
+    // name such as ":joy:" or a translated name.
+    const alt = node.alt;
+    if (
+      typeof alt === "string" &&
+      alt.length > 0 &&
+      alt.length <= 16 &&
+      alt.indexOf(":") === -1 &&
+      /[^\x00-\x7f]/.test(alt)
+    )
+      return alt;
+    return null;
+  }
+
+  function isUnicodeEmojiNode(node) {
+    return (
+      node &&
+      typeof node === "object" &&
+      node.type === "emoji" && // custom server emoji use a different type
+      !node.id
+    );
+  }
+
+  function fixRows(node, depth) {
+    if (!node || typeof node !== "object" || depth > 20) return 0;
+    let count = 0;
+    const keys = Array.isArray(node) ? node.map((_, i) => i) : Object.keys(node);
+    for (const k of keys) {
+      const child = node[k];
+      if (!child || typeof child !== "object") continue;
+      if (isUnicodeEmojiNode(child)) {
+        const ch = emojiChar(child);
+        if (ch) {
+          node[k] = { type: "text", content: ch };
+          count++;
+          continue;
+        }
+        if (LOG_MISSES && logged.size <= 40)
+          logOnce("node:" + String(child.src || child.alt || child.name),
+            "emoji node not converted:", JSON.stringify(child).slice(0, 300));
+      } else if (
+        typeof child.type === "string" &&
+        /emoji/i.test(child.type) &&
+        child.type !== "customEmoji"
+      ) {
+        if (LOG_MISSES)
+          logOnce("type:" + child.type, "other emoji-like node:", JSON.stringify(child).slice(0, 300));
+      }
+      count += fixRows(child, depth + 1);
+    }
+    return count;
+  }
+
+  function patchChat() {
+    const chat =
+      (ReactNative.NativeModules && ReactNative.NativeModules.DCDChatManager) ||
+      (globalThis.nativeModuleProxy && globalThis.nativeModuleProxy.DCDChatManager);
+    if (!chat) {
+      log("DCDChatManager not found");
+      return false;
+    }
+    let ok = false;
+    for (const name of ["updateRows", "addRows"]) {
+      if (typeof chat[name] !== "function") continue;
+      try {
+        unpatches.push(
+          before(name, chat, function (args) {
+            try {
+              for (let i = 0; i < args.length; i++) {
+                const a = args[i];
+                if (typeof a !== "string" || a[0] !== "[") continue;
+                if (!/"type"\s*:\s*"emoji"/.test(a)) continue; // nothing to do
+                const rows = JSON.parse(a);
+                const n = fixRows(rows, 0);
+                if (n) {
+                  args[i] = JSON.stringify(rows);
+                  logOnce("chat-ok", "replaced emoji in chat rows:", n);
+                }
+              }
+            } catch (e) {
+              logOnce("chat-err", "chat patch error:", String(e));
+            }
+            return args;
+          })
+        );
+        ok = true;
+      } catch (e) {}
+    }
+    return ok;
+  }
+
+  // ======================================================================
+  // LAYER 2: everything drawn with React Native images
+  // (emoji picker, menus, embeds, some reactions).
+  // ======================================================================
   function uriOf(v) {
     if (!v) return null;
     if (typeof v === "string") return v;
@@ -35,40 +185,12 @@
     return null;
   }
 
-  // Handles all of these:
-  //   asset:/emoji-1f600.png
-  //   emoji_1f600                (Android drawable name)
-  //   https://.../twemoji/.../1f468-200d-1f4bb.svg
-  function decode(uri) {
-    if (typeof uri !== "string" || !/emoji/i.test(uri)) return null;
-    if (/\/emojis\//i.test(uri)) return null; // custom server emoji, leave alone
-    const file = uri
-      .split("?")[0]
-      .split("#")[0]
-      .split("/")
-      .pop()
-      .replace(/\.(png|webp|svg|jpe?g)$/i, "");
-    const m = /^(?:twemoji[-_]|emoji[-_])?([0-9a-f]{2,6}(?:[-_][0-9a-f]{2,6})*)$/i.exec(
-      file
-    );
-    if (!m) return null;
-    try {
-      return String.fromCodePoint(
-        ...m[1].split(/[-_]/).map((h) => parseInt(h, 16))
-      );
-    } catch (e) {
-      return null;
-    }
-  }
-
   function num(n) {
     return typeof n === "number" && isFinite(n) && n > 0 ? n : null;
   }
 
-  // Find a size from style / fastImageStyle / direct props (square not required)
   function sizeOf(props) {
-    const sources = [props.fastImageStyle, props.style];
-    for (const s of sources) {
+    for (const s of [props.fastImageStyle, props.style]) {
       if (!s) continue;
       let f;
       try {
@@ -88,25 +210,16 @@
     return w || h || num(props.size) || null;
   }
 
-  // Returns Text props for the system emoji, or null if this isn't an emoji image
-  const missed = new Set();
+  let announced = false;
   function emojiTextProps(props) {
     if (!props || typeof props !== "object") return null;
-
-    const uri =
-      uriOf(props.src) || uriOf(props.source) || uriOf(props.uri) || null;
+    const uri = uriOf(props.src) || uriOf(props.source) || uriOf(props.uri);
     if (!uri) return null;
 
     const emoji = decode(uri);
     if (!emoji) {
-      if (LOG_MISSES && /emoji/i.test(uri) && !/\/emojis\//i.test(uri)) {
-        if (!missed.has(uri) && missed.size < 20) {
-          missed.add(uri);
-          try {
-            console.log("[System Emoji] not decoded:", uri, Object.keys(props));
-          } catch (e) {}
-        }
-      }
+      if (/emoji/i.test(uri) && !/\/emojis\//i.test(uri))
+        logOnce("img:" + uri, "image not decoded:", uri, Object.keys(props));
       return null;
     }
 
@@ -122,35 +235,23 @@
       style.width = size;
       style.height = size;
     }
-
-    if (DEBUG && !announced) {
+    if (!announced) {
       announced = true;
-      toast("System Emoji: replaced an emoji " + emoji);
+      toast("System Emoji: replaced an image emoji " + emoji);
     }
-
     return { allowFontScaling: false, children: emoji, style };
   }
 
-  let announced = false;
-  function toast(text) {
-    try {
-      vendetta.ui.toasts.showToast(text);
-    } catch (e) {}
-  }
-
-  // Runs before every React element is created
   function swapEmoji(args) {
     try {
-      const textProps = emojiTextProps(args[1]);
-      if (textProps) {
+      const t = emojiTextProps(args[1]);
+      if (t) {
         args[0] = ReactNative.Text;
-        args[1] = textProps;
+        args[1] = t;
       }
     } catch (e) {}
     return args;
   }
-
-  const unpatches = [];
 
   function tryBefore(name, parent) {
     try {
@@ -162,45 +263,58 @@
     return false;
   }
 
+  function patchImages() {
+    let ok = false;
+    // The two lookups can return the same module, so remove duplicates
+    // (patching the same function twice would double the work).
+    const runtimes = Array.from(
+      new Set([findByProps("jsx", "jsxs"), findByProps("jsxDEV")].filter(Boolean))
+    );
+    for (const rt of runtimes) {
+      ok = tryBefore("jsx", rt) || ok;
+      ok = tryBefore("jsxs", rt) || ok;
+      ok = tryBefore("jsxDEV", rt) || ok;
+    }
+    ok = tryBefore("createElement", React) || ok;
+
+    try {
+      const Img = ReactNative.Image;
+      if (Img && typeof Img.render === "function") {
+        unpatches.push(
+          instead("render", Img, function (a, orig) {
+            // Always run the original first. Its React hooks must run every
+            // time, otherwise React crashes when an image switches between
+            // an emoji and a normal picture.
+            const result = orig.apply(this, a);
+            try {
+              const t = emojiTextProps(a[0]);
+              if (t) return React.createElement(ReactNative.Text, t);
+            } catch (e) {}
+            return result;
+          })
+        );
+        ok = true;
+      }
+    } catch (e) {}
+    return ok;
+  }
+
   return {
     onLoad() {
-      let ok = false;
-
-      // JSX runtimes (there can be more than one)
-      const runtimes = [
-        findByProps("jsx", "jsxs"),
-        findByProps("jsxDEV"),
-      ].filter(Boolean);
-      for (const rt of runtimes) {
-        ok = tryBefore("jsx", rt) || ok;
-        ok = tryBefore("jsxs", rt) || ok;
-        ok = tryBefore("jsxDEV", rt) || ok;
-      }
-      ok = tryBefore("createElement", React) || ok;
-
-      // Backup: catch plain <Image> that slips past the element hooks
-      try {
-        const Img = ReactNative.Image;
-        if (Img && typeof Img.render === "function") {
-          unpatches.push(
-            instead("render", Img, function (a, orig) {
-              try {
-                const t = emojiTextProps(a[0]);
-                if (t) return React.createElement(ReactNative.Text, t);
-              } catch (e) {}
-              return orig.apply(this, a);
-            })
-          );
-          ok = true;
-        }
-      } catch (e) {}
-
-      if (DEBUG) {
-        toast(ok ? "System Emoji loaded" : "System Emoji: could not hook into Discord");
-      }
+      const a = FIX_MESSAGES ? patchChat() : false;
+      const b = FIX_IMAGES ? patchImages() : false;
+      toast(
+        "System Emoji loaded. Messages: " + (a ? "on" : "off") +
+        ", images: " + (b ? "on" : "off")
+      );
     },
     onUnload() {
-      unpatches.splice(0).forEach((unpatch) => unpatch());
+      // Undo patches newest-first so everything is restored cleanly.
+      unpatches.splice(0).reverse().forEach((u) => {
+        try {
+          u();
+        } catch (e) {}
+      });
     },
   };
 })();
