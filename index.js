@@ -5,6 +5,7 @@
   const SCALE = 0.7;          // emoji size inside image boxes (0.7 - 0.9)
   const DEBUG = true;         // popup messages (set false when everything works)
   const LOG_MISSES = true;    // write debug info to Revenge's debug logs
+  const SHOW_REPORT = true;   // popup window at startup showing what the plugin found
   const FIX_MESSAGES = true;  // layer 1: messages + replies (chat data)
   const FIX_IMAGES = true;    // layer 2: picker, menus, other images
   // -----------------------------------------------------------------------
@@ -121,42 +122,108 @@
     return count;
   }
 
+  // Looks for Discord's native chat module in every place it could be hiding.
+  const CHAT_NAMES = ["DCDChatManager", "NativeChatModule", "ChatModule", "DCDChat"];
+
+  function candidates() {
+    const list = [];
+    const seen = new Set();
+    const add = (label, obj) => {
+      if (obj && (typeof obj === "object" || typeof obj === "function") && !seen.has(obj)) {
+        seen.add(obj);
+        list.push({ label, obj });
+      }
+    };
+    const NM = ReactNative.NativeModules;
+    const proxy = globalThis.nativeModuleProxy;
+    const TMR = ReactNative.TurboModuleRegistry;
+    for (const n of CHAT_NAMES) {
+      try { add("NativeModules." + n, NM && NM[n]); } catch (e) {}
+      try { add("nativeModuleProxy." + n, proxy && proxy[n]); } catch (e) {}
+      try { add("TurboModule." + n, TMR && TMR.get && TMR.get(n)); } catch (e) {}
+    }
+    // Also scan every native module whose name mentions chat / DCD.
+    try {
+      for (const k of Object.keys(NM || {})) {
+        if (/chat|dcd/i.test(k)) add("NativeModules." + k, NM[k]);
+      }
+    } catch (e) {}
+    try { add("metro(updateRows)", findByProps("updateRows")); } catch (e) {}
+    return list;
+  }
+
+  function functionNames(obj) {
+    const names = new Set();
+    try {
+      let o = obj;
+      for (let d = 0; o && d < 3 && o !== Object.prototype; d++) {
+        for (const k of Object.getOwnPropertyNames(o)) {
+          try { if (typeof obj[k] === "function") names.add(k); } catch (e) {}
+        }
+        o = Object.getPrototypeOf(o);
+      }
+    } catch (e) {}
+    return Array.from(names);
+  }
+
+  function chatHook(args) {
+    try {
+      for (let i = 0; i < args.length; i++) {
+        const a = args[i];
+        if (typeof a !== "string" || a[0] !== "[") continue;
+        if (!/"type"\s*:\s*"emoji"/.test(a)) {
+          // Emoji data in a shape we don't know? Save a sample so it can be fixed.
+          const at = a.search(/emoji/i);
+          if (at !== -1 && LOG_MISSES && logged.size <= 40 && !logged.has("fmt")) {
+            logOnce("fmt", "emoji in unknown format, sample:", a.slice(Math.max(0, at - 120), at + 240));
+            toast("System Emoji: saw emoji data in an unknown format (see logs)");
+          }
+          continue;
+        }
+        const rows = JSON.parse(a);
+        const n = fixRows(rows, 0);
+        if (n) {
+          args[i] = JSON.stringify(rows);
+          logOnce("chat-ok", "replaced emoji in chat rows:", n);
+          if (!chatAnnounced) {
+            chatAnnounced = true;
+            toast("System Emoji: replaced " + n + " emoji in messages");
+          }
+        }
+      }
+    } catch (e) {
+      logOnce("chat-err", "chat patch error:", String(e));
+    }
+    return args;
+  }
+  let chatAnnounced = false;
+
   function patchChat() {
-    const chat =
-      (ReactNative.NativeModules && ReactNative.NativeModules.DCDChatManager) ||
-      (globalThis.nativeModuleProxy && globalThis.nativeModuleProxy.DCDChatManager);
-    if (!chat) {
-      log("DCDChatManager not found");
-      return false;
-    }
+    const report = [];
     let ok = false;
-    for (const name of ["updateRows", "addRows"]) {
-      if (typeof chat[name] !== "function") continue;
-      try {
-        unpatches.push(
-          before(name, chat, function (args) {
-            try {
-              for (let i = 0; i < args.length; i++) {
-                const a = args[i];
-                if (typeof a !== "string" || a[0] !== "[") continue;
-                if (!/"type"\s*:\s*"emoji"/.test(a)) continue; // nothing to do
-                const rows = JSON.parse(a);
-                const n = fixRows(rows, 0);
-                if (n) {
-                  args[i] = JSON.stringify(rows);
-                  logOnce("chat-ok", "replaced emoji in chat rows:", n);
-                }
-              }
-            } catch (e) {
-              logOnce("chat-err", "chat patch error:", String(e));
-            }
-            return args;
-          })
-        );
-        ok = true;
-      } catch (e) {}
+    const found = candidates();
+    if (!found.length) report.push("No chat module found anywhere.");
+    for (const { label, obj } of found) {
+      const fns = functionNames(obj);
+      report.push(label + " has: " + (fns.length ? fns.slice(0, 10).join(", ") : "no functions"));
+      for (const name of ["updateRows", "addRows"]) {
+        let orig;
+        try { orig = obj[name]; } catch (e) {}
+        if (typeof orig !== "function") continue;
+        try {
+          unpatches.push(before(name, obj, chatHook));
+          if (obj[name] !== orig) {
+            ok = true;
+            report.push("patched " + name);
+          } else {
+            report.push(name + ": patch did not stick");
+          }
+        } catch (e) {
+          report.push(name + ": patch failed (" + String(e).slice(0, 80) + ")");
+        }
+      }
     }
-    return ok;
+    return { ok, report };
   }
 
   // ======================================================================
@@ -299,16 +366,47 @@
     return ok;
   }
 
+  let reportTimer = null;
+
+  function showReport(lines) {
+    const text = lines.join("\n");
+    log("report:\n" + text);
+    try {
+      vendetta.ui.alerts.showConfirmationAlert({
+        title: "System Emoji report",
+        content: text,
+        confirmText: "OK",
+        onConfirm: function () {},
+      });
+    } catch (e) {
+      toast(lines.slice(0, 3).join(" | "));
+    }
+  }
+
   return {
     onLoad() {
-      const a = FIX_MESSAGES ? patchChat() : false;
-      const b = FIX_IMAGES ? patchImages() : false;
+      let platform = "unknown";
+      try { platform = ReactNative.Platform.OS; } catch (e) {}
+
+      const chat = FIX_MESSAGES ? patchChat() : { ok: false, report: ["(messages layer disabled)"] };
+      const images = FIX_IMAGES ? patchImages() : false;
+
       toast(
-        "System Emoji loaded. Messages: " + (a ? "on" : "off") +
-        ", images: " + (b ? "on" : "off")
+        "System Emoji loaded. Messages: " + (chat.ok ? "on" : "off") +
+        ", images: " + (images ? "on" : "off")
       );
+
+      if (SHOW_REPORT) {
+        const lines = [
+          "Platform: " + platform,
+          "Messages: " + (chat.ok ? "ON" : "OFF"),
+        ].concat(chat.report, ["Images: " + (images ? "ON (hooks attached)" : "OFF")]);
+        // Wait a few seconds so the app has finished starting before the popup.
+        reportTimer = setTimeout(function () { showReport(lines); }, 4000);
+      }
     },
     onUnload() {
+      if (reportTimer) clearTimeout(reportTimer);
       // Undo patches newest-first so everything is restored cleanly.
       unpatches.splice(0).reverse().forEach((u) => {
         try {
