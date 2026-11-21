@@ -10,7 +10,7 @@
 
   const { findByProps } = vendetta.metro;
   const { React, ReactNative } = vendetta.metro.common;
-  const { before } = vendetta.patcher;
+  const { before, after } = vendetta.patcher;
 
   // "asset:/emoji-1f600.png", ".../drawable/emoji-1f468-200d-1f4bb.png",
   // ".../twemoji/.../1f600.png"
@@ -123,8 +123,8 @@
 
   // ---------------- Debug sampling ----------------
   const samples = new Map();
-  const stats = { calls: 0, withUri: 0, replaced: 0, jumbo: 0 };
-  const hooks = { jsx: false, jsxs: false, createElement: false };
+  const stats = { calls: 0, withUri: 0, replaced: 0, jumbo: 0, imageRenders: 0, imageReplaced: 0 };
+  const hooks = { jsx: false, jsxs: false, createElement: false, image: false, fastImage: false };
   let copyTimer = null;
 
   function nameOf(type) {
@@ -206,6 +206,41 @@
   // ---------------- The actual replacement ----------------
   let announced = false;
 
+  function emojiTextProps(emoji, size) {
+    return {
+      allowFontScaling: false,
+      children: emoji,
+      style: {
+        width: size,
+        height: size,
+        fontSize: size * SCALE,
+        lineHeight: size,
+        textAlign: "center",
+        includeFontPadding: false,
+      },
+    };
+  }
+
+  // Second layer: runs AFTER an Image component has rendered. If it was an
+  // emoji image, throw its output away and draw the system emoji instead.
+  // (Keeps React's hook order intact, so it is safe for recycled list cells.)
+  function afterImageRender(args, ret) {
+    try {
+      const props = args && args[0];
+      if (!props || typeof props !== "object") return ret;
+      const uri = uriOf(props);
+      stats.imageRenders++;
+      record("Image.render", props, uri);
+      const emoji = decode(uri);
+      if (!emoji) return ret;
+      const size = sizeOf(props) || FALLBACK_SIZE;
+      stats.imageReplaced++;
+      return React.createElement(ReactNative.Text, emojiTextProps(emoji, size));
+    } catch (e) {
+      return ret;
+    }
+  }
+
   function swapEmoji(args) {
     try {
       const props = args[1];
@@ -238,18 +273,7 @@
       }
 
       args[0] = ReactNative.Text;
-      args[1] = {
-        allowFontScaling: false,
-        children: emoji,
-        style: {
-          width: size,
-          height: size,
-          fontSize: size * SCALE,
-          lineHeight: size,
-          textAlign: "center",
-          includeFontPadding: false,
-        },
-      };
+      args[1] = emojiTextProps(emoji, size);
 
       stats.replaced++;
       if (DEBUG && !announced) {
@@ -279,6 +303,25 @@
       tryPatch("jsx", runtime);
       tryPatch("jsxs", runtime);
       tryPatch("createElement", React);
+
+      // Layer 2: hook RN's Image (and FastImage if we can find it)
+      try {
+        const Img = ReactNative.Image;
+        if (Img && typeof Img.render === "function") {
+          unpatches.push(after("render", Img, afterImageRender));
+          hooks.image = true;
+        }
+      } catch (e) {}
+      try {
+        const FI = findByProps("cacheControl", "priority", "resizeMode");
+        const target =
+          FI && ((FI.type && FI.type.render ? FI.type : null) || FI);
+        if (target && typeof target.render === "function") {
+          unpatches.push(after("render", target, afterImageRender));
+          hooks.fastImage = true;
+        }
+      } catch (e) {}
+
       if (DEBUG) {
         toast(
           "System Emoji debug on. hooks: jsx=" +
@@ -286,7 +329,11 @@
             " jsxs=" +
             hooks.jsxs +
             " ce=" +
-            hooks.createElement
+            hooks.createElement +
+            " img=" +
+            hooks.image +
+            " fi=" +
+            hooks.fastImage
         );
         setTimeout(flush, 20000);
       }
