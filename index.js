@@ -2,16 +2,20 @@
   "use strict";
 
   // ---- Settings you can tweak -------------------------------------------
-  const SCALE = 0.8;   // emoji size relative to the image box (try 0.7 - 0.9)
-  const DEBUG = true;  // debug mode: toasts + copies info to the clipboard
+  const SCALE = 0.9;         // emoji glyph size vs. its box (try 0.8 - 1.0)
+  const JUMBO_SIZE = 56;     // size of emoji in messages that have ONLY emoji
+  const FALLBACK_SIZE = 32;  // used if an emoji image has no readable size
+  const DEBUG = true;        // debug mode: toasts + copies info to clipboard
   // -----------------------------------------------------------------------
 
   const { findByProps } = vendetta.metro;
   const { React, ReactNative } = vendetta.metro.common;
   const { before } = vendetta.patcher;
 
+  // "asset:/emoji-1f600.png", ".../drawable/emoji-1f468-200d-1f4bb.png",
+  // ".../twemoji/.../1f600.png"
   const EMOJI_URI =
-    /^(?:asset:\/emoji-|https?:\/\/[^\s]*twemoji[^\s]*\/)([0-9a-f]{2,6}(?:-[0-9a-f]{2,6})*)\.(?:png|webp|svg)(?:\?.*)?$/i;
+    /(?:emoji[-_]|twemoji[^?#]*\/)([0-9a-f]{2,6}(?:-[0-9a-f]{2,6})*)\.(?:png|webp|svg)(?:[?#].*)?$/i;
 
   function decode(uri) {
     if (typeof uri !== "string") return null;
@@ -34,22 +38,32 @@
     }
   }
 
-  function squareOf(style) {
-    const f = flat(style);
-    const w = f && f.width;
-    return typeof w === "number" && isFinite(w) && w > 0 && f.height === w
-      ? w
-      : null;
+  function num(v) {
+    return typeof v === "number" && isFinite(v) && v > 0 ? v : 0;
   }
 
+  // Looks at every place a size could be hiding and returns the biggest one
   function sizeOf(props) {
-    return (
-      squareOf(props.fastImageStyle) ||
-      squareOf(props.style) ||
-      (typeof props.width === "number" && props.width === props.height
-        ? props.width
-        : null)
-    );
+    let best = 0;
+    const consider = (v) => {
+      if (v > best) best = v;
+    };
+    [props.fastImageStyle, props.style].forEach((st) => {
+      const f = flat(st);
+      if (f) {
+        consider(num(f.width));
+        consider(num(f.height));
+      }
+    });
+    consider(num(props.width));
+    consider(num(props.height));
+    consider(num(props.size));
+    consider(num(props.emojiSize));
+    if (props.source && typeof props.source === "object") {
+      consider(num(props.source.width));
+      consider(num(props.source.height));
+    }
+    return best || null;
   }
 
   function toast(text) {
@@ -73,9 +87,43 @@
     return null;
   }
 
+  // ---------------- "Emoji only" message detection ----------------
+  let ONLY_EMOJI = null;
+  try {
+    ONLY_EMOJI = new RegExp(
+      "^[\\u200d\\ufe0f\\u20e3\\u{1f000}-\\u{1faff}\\u{2190}-\\u{21ff}" +
+        "\\u{2300}-\\u{23ff}\\u{2600}-\\u{27bf}\\u{2900}-\\u{297f}" +
+        "\\u{2b00}-\\u{2bff}\\u{3030}\\u{303d}\\u{3297}\\u{3299}\\u{a9}" +
+        "\\u{ae}\\u{203c}\\u{2049}\\u{2122}\\u{2139}]+$",
+      "u"
+    );
+  } catch (e) {}
+
+  let lastContent = null;
+  let lastResult = false;
+  let jumbo = false;
+  let jumboAt = 0;
+
+  function emojiOnly(content) {
+    if (content === lastContent) return lastResult;
+    let r = false;
+    try {
+      const stripped = content
+        .replace(/<a?:\w+:\d+>/g, "")
+        .replace(/[0-9#*]\ufe0f?\u20e3/g, "");
+      const rest = stripped.replace(/\s/g, "");
+      r =
+        content.trim().length > 0 &&
+        (rest.length === 0 || (ONLY_EMOJI ? ONLY_EMOJI.test(rest) : false));
+    } catch (e) {}
+    lastContent = content;
+    lastResult = r;
+    return r;
+  }
+
   // ---------------- Debug sampling ----------------
   const samples = new Map();
-  const stats = { calls: 0, withUri: 0, replaced: 0 };
+  const stats = { calls: 0, withUri: 0, replaced: 0, jumbo: 0 };
   const hooks = { jsx: false, jsxs: false, createElement: false };
   let copyTimer = null;
 
@@ -138,7 +186,7 @@
       const sz = uri ? sizeOf(props) : null;
       const hit =
         (uri && /emoji/i.test(uri)) ||
-        /emoji/i.test(name) ||
+        /emoji|reaction/i.test(name) ||
         props.emoji != null ||
         props.surrogate != null ||
         props.emojiName != null ||
@@ -164,6 +212,14 @@
       if (!props || typeof props !== "object") return args;
 
       stats.calls++;
+
+      // Remember whether the message being drawn is emoji-only
+      const msg = props.message;
+      if (msg && typeof msg === "object" && typeof msg.content === "string") {
+        jumbo = emojiOnly(msg.content);
+        jumboAt = Date.now();
+      }
+
       const uri = uriOf(props);
       if (uri) stats.withUri++;
 
@@ -172,8 +228,14 @@
       const emoji = decode(uri);
       if (!emoji) return args;
 
-      const size = sizeOf(props);
-      if (!size) return args;
+      let size = sizeOf(props) || FALLBACK_SIZE;
+
+      // Normal message-sized emoji (about 22) in an emoji-only message
+      // -> make it big
+      if (jumbo && Date.now() - jumboAt < 150 && size >= 21 && size <= 25) {
+        size = JUMBO_SIZE;
+        stats.jumbo++;
+      }
 
       args[0] = ReactNative.Text;
       args[1] = {
@@ -226,7 +288,6 @@
             " ce=" +
             hooks.createElement
         );
-        // also copy once after 20s, even if nothing matched
         setTimeout(flush, 20000);
       }
     },
