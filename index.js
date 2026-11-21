@@ -192,28 +192,89 @@
     }
   }
 
+  let genericCount = 0;
+
+  function isEmojiy(name, props, uri) {
+    return (
+      (uri && /emoji/i.test(uri)) ||
+      /emoji|reaction/i.test(name) ||
+      props.emoji != null ||
+      props.surrogate != null ||
+      props.emojiName != null
+    );
+  }
+
   function record(type, props, uri) {
     try {
-      if (!DEBUG || samples.size >= 40) return;
+      if (!DEBUG || samples.size >= 60) return;
       const name = nameOf(type);
       const sz = uri ? sizeOf(props) : null;
-      const hit =
-        (uri && /emoji/i.test(uri)) ||
-        /emoji|reaction/i.test(name) ||
-        props.emoji != null ||
-        props.surrogate != null ||
-        props.emojiName != null ||
-        (uri && sz && sz >= 12 && sz <= 90);
-      if (!hit) return;
+      const emojiy = isEmojiy(name, props, uri);
+      const generic = !emojiy && uri && sz && sz >= 12 && sz <= 90;
+      if (!emojiy && !generic) return;
+      if (generic && genericCount >= 12) return;
       const key =
         name +
         "|" +
         (uri || "").replace(/[0-9a-f]{4,}/gi, "#").replace(/\d+/g, "0");
       if (samples.has(key)) return;
+      if (generic) genericCount++;
       samples.set(key, { type: name, uri: uri, props: describe(props) });
       clearTimeout(copyTimer);
       copyTimer = setTimeout(flush, 5000);
     } catch (e) {}
+  }
+
+  // Shows what was collected in pop-up boxes you can screenshot
+  function short(v, n) {
+    const t = String(v == null ? "" : v);
+    return t.length > n ? t.slice(0, n) + "..." : t;
+  }
+
+  function showReport() {
+    try {
+      const all = Array.from(samples.values());
+      const row = samples.get("row-reactions");
+      const rest = all.filter((x) => x.type !== "row.message");
+      const first = rest.filter((x) => isEmojiy(x.type, x.props || {}, x.uri));
+      const others = rest.filter((x) => first.indexOf(x) === -1);
+      const lines = first
+        .concat(others)
+        .slice(0, 10)
+        .map((x, i) => {
+          const st = x.props && (x.props.style || x.props.fastImageStyle);
+          const size = st && typeof st === "object" ? st.w + "x" + st.h : "-";
+          return i + 1 + ") " + short(x.type, 22) + " | " + short(x.uri, 70) + " | " + size;
+        });
+
+      const page1 =
+        "hooks " +
+        JSON.stringify(hooks) +
+        "\nstats " +
+        JSON.stringify(stats) +
+        "\n\n" +
+        (row
+          ? "REACTION ROW: " + short(JSON.stringify(row.props), 650)
+          : "(no reaction row seen)");
+      const page2 = lines.length ? lines.join("\n") : "(no emoji images seen)";
+
+      const alerts = (vendetta.ui && vendetta.ui.alerts) || vendetta.alerts;
+      alerts.showConfirmationAlert({
+        title: "System Emoji debug 1/2",
+        content: page1,
+        confirmText: "Next",
+        onConfirm: function () {
+          alerts.showConfirmationAlert({
+            title: "System Emoji debug 2/2",
+            content: page2,
+            confirmText: "Done",
+            onConfirm: function () {},
+          });
+        },
+      });
+    } catch (e) {
+      toast("System Emoji debug: could not show report");
+    }
   }
 
   // ---------------- The actual replacement ----------------
@@ -520,6 +581,7 @@
             hooks.rows
         );
         setTimeout(flush, 20000);
+        setTimeout(showReport, 60000);
       }
     },
     onUnload() {
