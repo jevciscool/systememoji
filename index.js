@@ -136,8 +136,8 @@
 
   // ---------------- Debug sampling ----------------
   const samples = new Map();
-  const stats = { calls: 0, withUri: 0, replaced: 0, jumbo: 0, imageRenders: 0, imageReplaced: 0, rnImage: 0, rnImageReplaced: 0 };
-  const hooks = { jsx: false, jsxs: false, createElement: false, image: false, fastImage: false, rnImage: false };
+  const stats = { calls: 0, withUri: 0, replaced: 0, jumbo: 0, imageRenders: 0, imageReplaced: 0, rnImage: 0, rnImageReplaced: 0, rows: 0 };
+  const hooks = { jsx: false, jsxs: false, createElement: false, image: false, fastImage: false, rnImage: false, rows: false };
   let copyTimer = null;
 
   function nameOf(type) {
@@ -299,6 +299,109 @@
 
   const unpatches = [];
 
+  // ---------------- Messages: edit the chat data (Nexpid's method) --------
+  // Based on "Use System Emoji" by Nexpid
+  // (https://github.com/nexpid/RevengePlugins). Discord draws messages with a
+  // native chat list that is fed JSON "rows". We turn emoji nodes into plain
+  // text before the native list sees them, so Android draws them with the
+  // system emoji font. Emoji-only messages are wrapped in a big heading.
+  function iterateRows(rows) {
+    const content = [];
+    let header;
+    for (const original of rows) {
+      if (!original || typeof original !== "object") {
+        content.push(original);
+        continue;
+      }
+      let row = original;
+      if (row.type === "emoji" && typeof row.surrogate === "string")
+        row = { type: "text", content: row.surrogate };
+      if ("content" in row && Array.isArray(row.content))
+        row.content = iterateRows(row.content);
+      if ("items" in row && Array.isArray(row.items))
+        row.items = iterateRows(row.items);
+
+      if ("jumboable" in original && original.jumboable && !header) {
+        header = { type: "heading", level: 1, content: [] };
+      }
+      if (
+        (original.type === "emoji" || original.type === "customEmoji") &&
+        !original.jumboable &&
+        header
+      ) {
+        content.push(header);
+        header = undefined;
+      }
+
+      if (header) header.content.push(row);
+      else content.push(row);
+    }
+    if (header) content.push(header);
+    return content;
+  }
+
+  function processRowsArgs(args) {
+    try {
+      for (let i = 0; i < args.length; i++) {
+        const a = args[i];
+        if (typeof a !== "string" || a.charAt(0) !== "[") continue;
+        const rows = JSON.parse(a);
+        if (!Array.isArray(rows)) break;
+        let changed = false;
+        for (const row of rows) {
+          if (!row || row.type !== 1 || !row.message) continue;
+          if (DEBUG && !samples.has("row-reactions") && row.message.reactions) {
+            samples.set("row-reactions", {
+              type: "row.message",
+              uri: null,
+              props: {
+                rowKeys: Object.keys(row).slice(0, 25).join(","),
+                msgKeys: Object.keys(row.message).slice(0, 45).join(","),
+                reactions: JSON.stringify(row.message.reactions).slice(0, 700),
+              },
+            });
+            clearTimeout(copyTimer);
+            copyTimer = setTimeout(flush, 5000);
+          }
+          if (Array.isArray(row.message.content)) {
+            row.message.content = iterateRows(row.message.content);
+            changed = true;
+          }
+        }
+        if (changed) {
+          args[i] = JSON.stringify(rows);
+          stats.rows++;
+        }
+        break;
+      }
+    } catch (e) {}
+    return args;
+  }
+
+  function hookRows() {
+    let ok = false;
+    const targets = [];
+    try {
+      const NM = ReactNative.NativeModules;
+      ["DCDChatManager", "NativeChatModule"].forEach((n) => {
+        if (NM && NM[n]) targets.push(NM[n]);
+      });
+    } catch (e) {}
+    try {
+      const found = findByProps("updateRows");
+      if (found && targets.indexOf(found) === -1) targets.push(found);
+    } catch (e) {}
+    targets.forEach((t) => {
+      try {
+        if (typeof t.updateRows === "function") {
+          unpatches.push(before("updateRows", t, processRowsArgs));
+          ok = true;
+        }
+      } catch (e) {}
+    });
+    return ok;
+  }
+
   // Third layer: replace React Native's Image with a wrapper. Any screen that
   // looks up "Image" while drawing (reactions, picker...) gets the wrapper,
   // which draws emoji as text and passes every other image through untouched.
@@ -369,6 +472,9 @@
 
   return {
     onLoad() {
+      try {
+        hooks.rows = hookRows();
+      } catch (e) {}
       const runtime = findByProps("jsx", "jsxs");
       tryPatch("jsx", runtime);
       tryPatch("jsxs", runtime);
@@ -409,7 +515,9 @@
             " fi=" +
             hooks.fastImage +
             " rn=" +
-            hooks.rnImage
+            hooks.rnImage +
+            " rows=" +
+            hooks.rows
         );
         setTimeout(flush, 20000);
       }
