@@ -3,5 +3,5 @@
   "description": "Replaces Discord's Twemoji images with your phone's system emoji.",
   "authors": [{ "name": "jevciscool" }],
   "main": "index.js",
-  "hash": "v4"
+  "hash": "v5"
 }
